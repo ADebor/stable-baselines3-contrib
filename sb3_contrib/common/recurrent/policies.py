@@ -18,12 +18,13 @@ from torch import nn
 
 from sb3_contrib.common.recurrent.type_aliases import RNNStates
 
+# from nmn_continuous.src.nmn import GRU
 
 class RecurrentActorCriticPolicy(ActorCriticPolicy):
     """
     Recurrent policy class for actor-critic algorithms (has both policy and value prediction).
     To be used with A2C, PPO and the likes.
-    It assumes that both the actor and the critic LSTM
+    It assumes that both the actor and the critic RNN
     have the same architecture.
 
     :param observation_space: Observation space
@@ -51,13 +52,13 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
         ``th.optim.Adam`` by default
     :param optimizer_kwargs: Additional keyword arguments,
         excluding the learning rate, to pass to the optimizer
-    :param lstm_hidden_size: Number of hidden units for each LSTM layer.
-    :param n_lstm_layers: Number of LSTM layers.
-    :param shared_lstm: Whether the LSTM is shared between the actor and the critic
+    :param rnn_hidden_size: Number of hidden units for each RNN layer.
+    :param n_rnn_layers: Number of RNN layers.
+    :param shared_rnn: Whether the RNN is shared between the actor and the critic
         (in that case, only the actor gradient is used)
-        By default, the actor and the critic have two separate LSTM.
-    :param enable_critic_lstm: Use a seperate LSTM for the critic.
-    :param lstm_kwargs: Additional keyword arguments to pass the the LSTM
+        By default, the actor and the critic have two separate RNN.
+    :param enable_critic_rnn: Use a seperate RNN for the critic.
+    :param rnn_kwargs: Additional keyword arguments to pass the the RNN
         constructor.
     """
 
@@ -70,6 +71,7 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
         activation_fn: Type[nn.Module] = nn.Tanh,
         ortho_init: bool = True,
         use_sde: bool = False,
+        use_beta: bool = False,
         log_std_init: float = 0.0,
         full_std: bool = True,
         use_expln: bool = False,
@@ -80,13 +82,18 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
         normalize_images: bool = True,
         optimizer_class: Type[th.optim.Optimizer] = th.optim.Adam,
         optimizer_kwargs: Optional[Dict[str, Any]] = None,
-        lstm_hidden_size: int = 256,
-        n_lstm_layers: int = 1,
-        shared_lstm: bool = False,
-        enable_critic_lstm: bool = True,
-        lstm_kwargs: Optional[Dict[str, Any]] = None,
+        # rnn_type: Optional[str] = "lstm",
+        rnn_type: Optional[Type[nn.Module]] = nn.LSTM,
+        rnn_hidden_size: int = 256,
+        n_rnn_layers: int = 1,
+        shared_rnn: bool = False,
+        enable_critic_rnn: bool = True,
+        rnn_kwargs: Optional[Dict[str, Any]] = None,
+        rnn_input_dim: Optional[int] = None,
+        *args, **kwargs,
     ):
-        self.lstm_output_dim = lstm_hidden_size
+        
+        self.rnn_output_dim = rnn_hidden_size
         super().__init__(
             observation_space,
             action_space,
@@ -95,6 +102,7 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
             activation_fn,
             ortho_init,
             use_sde,
+            use_beta,
             log_std_init,
             full_std,
             use_expln,
@@ -107,42 +115,84 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
             optimizer_kwargs,
         )
 
-        self.lstm_kwargs = lstm_kwargs or {}
-        self.shared_lstm = shared_lstm
-        self.enable_critic_lstm = enable_critic_lstm
-        self.lstm_actor = nn.LSTM(
-            self.features_dim,
-            lstm_hidden_size,
-            num_layers=n_lstm_layers,
-            **self.lstm_kwargs,
+        # RNNs creation
+        self.rnn_kwargs = rnn_kwargs or {}
+        self.shared_rnn = shared_rnn
+        self.enable_critic_rnn = enable_critic_rnn
+
+        if not issubclass(rnn_type, (nn.LSTM, nn.GRU)):
+            print("Invalid RNN type. Falling off to LSTM.")
+            rnn_type = nn.LSTM
+
+        if rnn_input_dim is not None:
+            self.rnn_input_dim = rnn_input_dim
+        else:
+            self.rnn_input_dim = self.features_dim
+        
+        self.rnn_type = rnn_type
+        self.rnn_actor = rnn_type(
+            self.rnn_input_dim,
+            rnn_hidden_size,
+            num_layers=n_rnn_layers,
+            **self.rnn_kwargs,
         )
+
+        # if rnn_type == "lstm":
+        #     self.rnn_actor = nn.LSTM(
+        #         self.rnn_input_dim,
+        #         rnn_hidden_size,
+        #         num_layers=n_rnn_layers,
+        #         **self.rnn_kwargs,
+        #     )
+        # elif rnn_type == "gru":
+        #     self.rnn_actor = GRU(
+        #         self.rnn_input_dim,
+        #         rnn_hidden_size,
+        #         num_layers=n_rnn_layers,
+        #         **self.rnn_kwargs,
+        #     )
+
         # For the predict() method, to initialize hidden states
-        # (n_lstm_layers, batch_size, lstm_hidden_size)
-        self.lstm_hidden_state_shape = (n_lstm_layers, 1, lstm_hidden_size)
+        # (n_rnn_layers, batch_size, rnn_hidden_size)
+        self.rnn_hidden_state_shape = (n_rnn_layers, 1, rnn_hidden_size)
         self.critic = None
-        self.lstm_critic = None
+        self.rnn_critic = None
         assert not (
-            self.shared_lstm and self.enable_critic_lstm
-        ), "You must choose between shared LSTM, seperate or no LSTM for the critic."
+            self.shared_rnn and self.enable_critic_rnn
+        ), "You must choose between shared RNN, seperate or no RNN for the critic."
 
         assert not (
-            self.shared_lstm and not self.share_features_extractor
-        ), "If the features extractor is not shared, the LSTM cannot be shared."
+            self.shared_rnn and not self.share_features_extractor
+        ), "If the features extractor is not shared, the RNN cannot be shared."
 
-        # No LSTM for the critic, we still need to convert
+        # No RNN for the critic, we still need to convert
         # output of features extractor to the correct size
-        # (size of the output of the actor lstm)
-        if not (self.shared_lstm or self.enable_critic_lstm):
-            self.critic = nn.Linear(self.features_dim, lstm_hidden_size)
+        # (size of the output of the actor rnn)
+        if not (self.shared_rnn or self.enable_critic_rnn):
+            self.critic = nn.Linear(self.features_dim, rnn_hidden_size) # this will fail as features_dim should be replaced by rnn_output_dim
 
-        # Use a separate LSTM for the critic
-        if self.enable_critic_lstm:
-            self.lstm_critic = nn.LSTM(
-                self.features_dim,
-                lstm_hidden_size,
-                num_layers=n_lstm_layers,
-                **self.lstm_kwargs,
+        # Use a separate RNN for the critic
+        if self.enable_critic_rnn:
+            self.rnn_critic = rnn_type(
+                self.rnn_input_dim,
+                rnn_hidden_size,
+                num_layers=n_rnn_layers,
+                **self.rnn_kwargs,
             )
+        #     if rnn_type == "lstm":
+        #         self.rnn_critic = nn.LSTM(
+        #             self.rnn_input_dim,
+        #             rnn_hidden_size,
+        #             num_layers=n_rnn_layers,
+        #             **self.rnn_kwargs,
+        #         )
+        #     elif rnn_type == "gru":
+        #         self.rnn_critic = GRU(
+        #             self.rnn_input_dim,
+        #             rnn_hidden_size,
+        #             num_layers=n_rnn_layers,
+        #             **self.rnn_kwargs,
+        #         )
 
         # Setup optimizer with initial learning rate
         self.optimizer = self.optimizer_class(self.parameters(), lr=lr_schedule(1), **self.optimizer_kwargs)
@@ -153,7 +203,7 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
         Part of the layers can be shared.
         """
         self.mlp_extractor = MlpExtractor(
-            self.lstm_output_dim,
+            self.rnn_output_dim,
             net_arch=self.net_arch,
             activation_fn=self.activation_fn,
             device=self.device,
@@ -162,58 +212,69 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
     @staticmethod
     def _process_sequence(
         features: th.Tensor,
-        lstm_states: Tuple[th.Tensor, th.Tensor],
+        rnn_states: Union[Tuple[th.Tensor, th.Tensor], Tuple[th.Tensor]],
         episode_starts: th.Tensor,
-        lstm: nn.LSTM,
+        rnn: Union[nn.LSTM, nn.GRU],
     ) -> Tuple[th.Tensor, th.Tensor]:
         """
-        Do a forward pass in the LSTM network.
+        Do a forward pass in the RNN network.
 
         :param features: Input tensor
-        :param lstm_states: previous hidden and cell states of the LSTM, respectively
+        :param rnn_states: previous hidden and cell states of the RNN, respectively
         :param episode_starts: Indicates when a new episode starts,
-            in that case, we need to reset LSTM states.
-        :param lstm: LSTM object.
-        :return: LSTM output and updated LSTM states.
+            in that case, we need to reset RNN states.
+        :param rnn: RNN object.
+        :return: RNN output and updated RNN states.
         """
-        # LSTM logic
+        # RNN logic
         # (sequence length, batch size, features dim)
         # (batch size = n_envs for data collection or n_seq when doing gradient update)
-        n_seq = lstm_states[0].shape[1]
+        n_seq = rnn_states[0].shape[1]
+
         # Batch to sequence
         # (padded batch size, features_dim) -> (n_seq, max length, features_dim) -> (max length, n_seq, features_dim)
         # note: max length (max sequence length) is always 1 during data collection
-        features_sequence = features.reshape((n_seq, -1, lstm.input_size)).swapaxes(0, 1)
+        features_sequence = features.reshape((n_seq, -1, rnn.input_size)).swapaxes(0, 1)
         episode_starts = episode_starts.reshape((n_seq, -1)).swapaxes(0, 1)
 
         # If we don't have to reset the state in the middle of a sequence
         # we can avoid the for loop, which speeds up things
         if th.all(episode_starts == 0.0):
-            lstm_output, lstm_states = lstm(features_sequence, lstm_states)
-            lstm_output = th.flatten(lstm_output.transpose(0, 1), start_dim=0, end_dim=1)
-            return lstm_output, lstm_states
+            rnn_output, rnn_states = rnn(features_sequence, rnn_states)
+            rnn_output = th.flatten(rnn_output.transpose(0, 1), start_dim=0, end_dim=1)
+            return rnn_output, rnn_states
 
-        lstm_output = []
+        rnn_output = []
+
         # Iterate over the sequence
         for features, episode_start in zip_strict(features_sequence, episode_starts):
-            hidden, lstm_states = lstm(
-                features.unsqueeze(dim=0),
-                (
+            if len(rnn_states) == 2:
+                rnn_states = (
                     # Reset the states at the beginning of a new episode
-                    (1.0 - episode_start).view(1, n_seq, 1) * lstm_states[0],
-                    (1.0 - episode_start).view(1, n_seq, 1) * lstm_states[1],
-                ),
+                    (1.0 - episode_start).view(1, n_seq, 1) * rnn_states[0],
+                    (1.0 - episode_start).view(1, n_seq, 1) * rnn_states[1],
+                )
+            else:
+                rnn_states = (
+                    # Reset the states at the beginning of a new episode
+                    (1.0 - episode_start).view(1, n_seq, 1)
+                    * rnn_states[0],
+                )
+            hidden, rnn_states = rnn(
+                features.unsqueeze(dim=0),
+                rnn_states,
             )
-            lstm_output += [hidden]
+            rnn_output += [hidden]
+
         # Sequence to batch
-        # (sequence length, n_seq, lstm_out_dim) -> (batch_size, lstm_out_dim)
-        lstm_output = th.flatten(th.cat(lstm_output).transpose(0, 1), start_dim=0, end_dim=1)
-        return lstm_output, lstm_states
+        # (sequence length, n_seq, rnn_out_dim) -> (batch_size, rnn_out_dim)
+        rnn_output = th.flatten(th.cat(rnn_output).transpose(0, 1), start_dim=0, end_dim=1)
+        return rnn_output, rnn_states
 
     def forward(
         self,
         obs: th.Tensor,
-        lstm_states: RNNStates,
+        rnn_states: RNNStates,
         episode_starts: th.Tensor,
         deterministic: bool = False,
     ) -> Tuple[th.Tensor, th.Tensor, th.Tensor, RNNStates]:
@@ -221,9 +282,9 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
         Forward pass in all the networks (actor and critic)
 
         :param obs: Observation. Observation
-        :param lstm_states: The last hidden and memory states for the LSTM.
+        :param rnn_states: The last hidden and memory states for the RNN.
         :param episode_starts: Whether the observations correspond to new episodes
-            or not (we reset the lstm states in that case).
+            or not (we reset the rnn states in that case).
         :param deterministic: Whether to sample or use deterministic actions
         :return: action, value and log probability of the action
         """
@@ -233,18 +294,22 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
             pi_features = vf_features = features  # alis
         else:
             pi_features, vf_features = features
-        # latent_pi, latent_vf = self.mlp_extractor(features)
-        latent_pi, lstm_states_pi = self._process_sequence(pi_features, lstm_states.pi, episode_starts, self.lstm_actor)
-        if self.lstm_critic is not None:
-            latent_vf, lstm_states_vf = self._process_sequence(vf_features, lstm_states.vf, episode_starts, self.lstm_critic)
-        elif self.shared_lstm:
-            # Re-use LSTM features but do not backpropagate
+
+        latent_pi, rnn_states_pi = self._process_sequence(pi_features, rnn_states.pi, episode_starts, self.rnn_actor)
+
+        if self.rnn_critic is not None:
+            latent_vf, rnn_states_vf = self._process_sequence(vf_features, rnn_states.vf, episode_starts, self.rnn_critic)
+        elif self.shared_rnn:
+            # Re-use RNN features but do not backpropagate
             latent_vf = latent_pi.detach()
-            lstm_states_vf = (lstm_states_pi[0].detach(), lstm_states_pi[1].detach())
+            if self.rnn_type == nn.LSTM:
+                rnn_states_vf = (rnn_states_pi[0].detach(), rnn_states_pi[1].detach())
+            else:
+                rnn_states_vf = rnn_states_pi[0].detach()
         else:
             # Critic only has a feedforward network
             latent_vf = self.critic(vf_features)
-            lstm_states_vf = lstm_states_pi
+            rnn_states_vf = rnn_states_pi
 
         latent_pi = self.mlp_extractor.forward_actor(latent_pi)
         latent_vf = self.mlp_extractor.forward_critic(latent_vf)
@@ -254,52 +319,54 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
         distribution = self._get_action_dist_from_latent(latent_pi)
         actions = distribution.get_actions(deterministic=deterministic)
         log_prob = distribution.log_prob(actions)
-        return actions, values, log_prob, RNNStates(lstm_states_pi, lstm_states_vf)
+        return actions, values, log_prob, RNNStates(rnn_states_pi, rnn_states_vf)
 
     def get_distribution(
         self,
         obs: th.Tensor,
-        lstm_states: Tuple[th.Tensor, th.Tensor],
+        rnn_states: Union[Tuple[th.Tensor, th.Tensor], Tuple[th.Tensor]],
         episode_starts: th.Tensor,
     ) -> Tuple[Distribution, Tuple[th.Tensor, ...]]:
         """
         Get the current policy distribution given the observations.
 
         :param obs: Observation.
-        :param lstm_states: The last hidden and memory states for the LSTM.
+        :param rnn_states: The last hidden and memory states for the RNN.
         :param episode_starts: Whether the observations correspond to new episodes
-            or not (we reset the lstm states in that case).
+            or not (we reset the rnn states in that case).
         :return: the action distribution and new hidden states.
         """
         # Call the method from the parent of the parent class
         features = super(ActorCriticPolicy, self).extract_features(obs, self.pi_features_extractor)
-        latent_pi, lstm_states = self._process_sequence(features, lstm_states, episode_starts, self.lstm_actor)
+        latent_pi, rnn_states = self._process_sequence(features, rnn_states, episode_starts, self.rnn_actor)
         latent_pi = self.mlp_extractor.forward_actor(latent_pi)
-        return self._get_action_dist_from_latent(latent_pi), lstm_states
+        return self._get_action_dist_from_latent(latent_pi), rnn_states
 
     def predict_values(
         self,
         obs: th.Tensor,
-        lstm_states: Tuple[th.Tensor, th.Tensor],
+        rnn_states: Union[Tuple[th.Tensor, th.Tensor], Tuple[th.Tensor]],
         episode_starts: th.Tensor,
     ) -> th.Tensor:
         """
         Get the estimated values according to the current policy given the observations.
 
         :param obs: Observation.
-        :param lstm_states: The last hidden and memory states for the LSTM.
+        :param rnn_states: The last hidden and memory states for the RNN.
         :param episode_starts: Whether the observations correspond to new episodes
-            or not (we reset the lstm states in that case).
+            or not (we reset the rnn states in that case).
         :return: the estimated values.
         """
+        # NOTE: This is the same logic as in the forward method.
+
         # Call the method from the parent of the parent class
         features = super(ActorCriticPolicy, self).extract_features(obs, self.vf_features_extractor)
 
-        if self.lstm_critic is not None:
-            latent_vf, lstm_states_vf = self._process_sequence(features, lstm_states, episode_starts, self.lstm_critic)
-        elif self.shared_lstm:
-            # Use LSTM from the actor
-            latent_pi, _ = self._process_sequence(features, lstm_states, episode_starts, self.lstm_actor)
+        if self.rnn_critic is not None:
+            latent_vf, rnn_states_vf = self._process_sequence(features, rnn_states, episode_starts, self.rnn_critic)
+        elif self.shared_rnn:
+            # Use RNN from the actor
+            latent_pi, _ = self._process_sequence(features, rnn_states, episode_starts, self.rnn_actor)
             latent_vf = latent_pi.detach()
         else:
             latent_vf = self.critic(features)
@@ -308,7 +375,7 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
         return self.value_net(latent_vf)
 
     def evaluate_actions(
-        self, obs: th.Tensor, actions: th.Tensor, lstm_states: RNNStates, episode_starts: th.Tensor
+        self, obs: th.Tensor, actions: th.Tensor, rnn_states: RNNStates, episode_starts: th.Tensor
     ) -> Tuple[th.Tensor, th.Tensor, th.Tensor]:
         """
         Evaluate actions according to the current policy,
@@ -316,9 +383,9 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
 
         :param obs: Observation.
         :param actions:
-        :param lstm_states: The last hidden and memory states for the LSTM.
+        :param rnn_states: The last hidden and memory states for the RNN.
         :param episode_starts: Whether the observations correspond to new episodes
-            or not (we reset the lstm states in that case).
+            or not (we reset the rnn states in that case).
         :return: estimated value, log likelihood of taking those actions
             and entropy of the action distribution.
         """
@@ -328,10 +395,12 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
             pi_features = vf_features = features  # alias
         else:
             pi_features, vf_features = features
-        latent_pi, _ = self._process_sequence(pi_features, lstm_states.pi, episode_starts, self.lstm_actor)
-        if self.lstm_critic is not None:
-            latent_vf, _ = self._process_sequence(vf_features, lstm_states.vf, episode_starts, self.lstm_critic)
-        elif self.shared_lstm:
+
+        # process the sequence
+        latent_pi, _ = self._process_sequence(pi_features, rnn_states.pi, episode_starts, self.rnn_actor)
+        if self.rnn_critic is not None:
+            latent_vf, _ = self._process_sequence(vf_features, rnn_states.vf, episode_starts, self.rnn_critic)
+        elif self.shared_rnn:
             latent_vf = latent_pi.detach()
         else:
             latent_vf = self.critic(vf_features)
@@ -347,7 +416,7 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
     def _predict(
         self,
         observation: th.Tensor,
-        lstm_states: Tuple[th.Tensor, th.Tensor],
+        rnn_states: Union[Tuple[th.Tensor, th.Tensor], Tuple[th.Tensor]],
         episode_starts: th.Tensor,
         deterministic: bool = False,
     ) -> Tuple[th.Tensor, Tuple[th.Tensor, ...]]:
@@ -355,14 +424,14 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
         Get the action according to the policy for a given observation.
 
         :param observation:
-        :param lstm_states: The last hidden and memory states for the LSTM.
+        :param rnn_states: The last hidden and memory states for the RNN.
         :param episode_starts: Whether the observations correspond to new episodes
-            or not (we reset the lstm states in that case).
+            or not (we reset the rnn states in that case).
         :param deterministic: Whether to use stochastic or deterministic actions
         :return: Taken action according to the policy and hidden states of the RNN
         """
-        distribution, lstm_states = self.get_distribution(observation, lstm_states, episode_starts)
-        return distribution.get_actions(deterministic=deterministic), lstm_states
+        distribution, rnn_states = self.get_distribution(observation, rnn_states, episode_starts)
+        return distribution.get_actions(deterministic=deterministic), rnn_states
 
     def predict(
         self,
@@ -376,9 +445,9 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
         Includes sugar-coating to handle different observations (e.g. normalizing images).
 
         :param observation: the input observation
-        :param lstm_states: The last hidden and memory states for the LSTM.
+        :param rnn_states: The last hidden and memory states for the RNN.
         :param episode_starts: Whether the observations correspond to new episodes
-            or not (we reset the lstm states in that case).
+            or not (we reset the rnn states in that case).
         :param deterministic: Whether or not to return deterministic actions.
         :return: the model's action and the next hidden state
             (used in recurrent policies)
@@ -395,7 +464,7 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
         # state : (n_layers, n_envs, dim)
         if state is None:
             # Initialize hidden states to zeros
-            state = np.concatenate([np.zeros(self.lstm_hidden_state_shape) for _ in range(n_envs)], axis=1)
+            state = np.concatenate([np.zeros(self.rnn_hidden_state_shape) for _ in range(n_envs)], axis=1)
             state = (state, state)
 
         if episode_start is None:
@@ -403,14 +472,20 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
 
         with th.no_grad():
             # Convert to PyTorch tensors
-            states = th.tensor(state[0], dtype=th.float32, device=self.device), th.tensor(
-                state[1], dtype=th.float32, device=self.device
-            )
+            if self.rnn_type == nn.LSTM:
+                states = th.tensor(state[0], dtype=th.float32, device=self.device), th.tensor(
+                    state[1], dtype=th.float32, device=self.device
+                )
+            else:
+                states = (th.tensor(state[0], dtype=th.float32, device=self.device),)
             episode_starts = th.tensor(episode_start, dtype=th.float32, device=self.device)
             actions, states = self._predict(
-                observation, lstm_states=states, episode_starts=episode_starts, deterministic=deterministic
+                observation, rnn_states=states, episode_starts=episode_starts, deterministic=deterministic
             )
-            states = (states[0].cpu().numpy(), states[1].cpu().numpy())
+            if self.rnn_type == nn.LSTM:
+                states = (states[0].cpu().numpy(), states[1].cpu().numpy())
+            else:
+                states = (states[0].cpu().numpy(),)
 
         # Convert to numpy
         actions = actions.cpu().numpy()

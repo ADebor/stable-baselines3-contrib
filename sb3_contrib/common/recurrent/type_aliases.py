@@ -16,10 +16,21 @@ class RecurrentRolloutBufferSamples(NamedTuple):
     old_log_prob: th.Tensor
     advantages: th.Tensor
     returns: th.Tensor
-    lstm_states: RNNStates
+    rnn_states: RNNStates
     episode_starts: th.Tensor
     mask: th.Tensor
 
+# class MetaRecurrentRolloutBufferSamples(NamedTuple):
+#     observations: th.Tensor
+#     actions: th.Tensor
+#     prev_obs: th.Tensor # [prev_obs, prev_actions, prev_rewards]
+#     old_values: th.Tensor
+#     old_log_prob: th.Tensor
+#     advantages: th.Tensor
+#     returns: th.Tensor
+#     rnn_states: RNNStates
+#     episode_starts: th.Tensor
+#     mask: th.Tensor
 
 class RecurrentDictRolloutBufferSamples(NamedTuple):
     observations: TensorDict

@@ -4,6 +4,6 @@ from sb3_contrib.common.recurrent.policies import (
     RecurrentMultiInputActorCriticPolicy,
 )
 
-MlpLstmPolicy = RecurrentActorCriticPolicy
+MlpRnnPolicy = RecurrentActorCriticPolicy
 CnnLstmPolicy = RecurrentActorCriticCnnPolicy
 MultiInputLstmPolicy = RecurrentMultiInputActorCriticPolicy

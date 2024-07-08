@@ -5,6 +5,7 @@ from typing import Any, ClassVar, Dict, Optional, Type, TypeVar, Union
 
 import numpy as np
 import torch as th
+import torch.nn as nn
 from gymnasium import spaces
 from stable_baselines3.common.buffers import RolloutBuffer
 from stable_baselines3.common.callbacks import BaseCallback
@@ -17,15 +18,16 @@ from stable_baselines3.common.vec_env import VecEnv
 from sb3_contrib.common.recurrent.buffers import RecurrentDictRolloutBuffer, RecurrentRolloutBuffer
 from sb3_contrib.common.recurrent.policies import RecurrentActorCriticPolicy
 from sb3_contrib.common.recurrent.type_aliases import RNNStates
-from sb3_contrib.ppo_recurrent.policies import CnnLstmPolicy, MlpLstmPolicy, MultiInputLstmPolicy
+from sb3_contrib.ppo_recurrent.policies import CnnLstmPolicy, MlpRnnPolicy, MultiInputLstmPolicy
 
 SelfRecurrentPPO = TypeVar("SelfRecurrentPPO", bound="RecurrentPPO")
 
+# import wandb
 
 class RecurrentPPO(OnPolicyAlgorithm):
     """
     Proximal Policy Optimization algorithm (PPO) (clip version)
-    with support for recurrent policies (LSTM).
+    with support for recurrent policies (LSTM and GRU).
 
     Based on the original Stable Baselines 3 implementation.
 
@@ -68,7 +70,7 @@ class RecurrentPPO(OnPolicyAlgorithm):
     """
 
     policy_aliases: ClassVar[Dict[str, Type[BasePolicy]]] = {
-        "MlpLstmPolicy": MlpLstmPolicy,
+        "MlpRnnPolicy": MlpRnnPolicy,
         "CnnLstmPolicy": CnnLstmPolicy,
         "MultiInputLstmPolicy": MultiInputLstmPolicy,
     }
@@ -88,8 +90,9 @@ class RecurrentPPO(OnPolicyAlgorithm):
         normalize_advantage: bool = True,
         ent_coef: float = 0.0,
         vf_coef: float = 0.5,
-        max_grad_norm: float = 0.5,
+        max_grad_norm: float = 1.,
         use_sde: bool = False,
+        use_beta: bool = False,
         sde_sample_freq: int = -1,
         target_kl: Optional[float] = None,
         stats_window_size: int = 100,
@@ -112,6 +115,7 @@ class RecurrentPPO(OnPolicyAlgorithm):
             max_grad_norm=max_grad_norm,
             use_sde=use_sde,
             sde_sample_freq=sde_sample_freq,
+            use_beta=use_beta,
             stats_window_size=stats_window_size,
             tensorboard_log=tensorboard_log,
             policy_kwargs=policy_kwargs,
@@ -133,7 +137,9 @@ class RecurrentPPO(OnPolicyAlgorithm):
         self.clip_range_vf = clip_range_vf
         self.normalize_advantage = normalize_advantage
         self.target_kl = target_kl
-        self._last_lstm_states = None
+        self._last_rnn_states = None
+
+        self.use_beta = use_beta
 
         if _init_setup_model:
             self._setup_model()
@@ -145,41 +151,53 @@ class RecurrentPPO(OnPolicyAlgorithm):
         buffer_cls = RecurrentDictRolloutBuffer if isinstance(self.observation_space, spaces.Dict) else RecurrentRolloutBuffer
 
         self.policy = self.policy_class(
-            self.observation_space,
-            self.action_space,
-            self.lr_schedule,
+            observation_space=self.observation_space,
+            action_space=self.action_space,
+            lr_schedule=self.lr_schedule,
             use_sde=self.use_sde,
+            use_beta=self.use_beta,
             **self.policy_kwargs,
         )
         self.policy = self.policy.to(self.device)
 
-        # We assume that LSTM for the actor and the critic
+        # We assume that RNN for the actor and the critic
         # have the same architecture
-        lstm = self.policy.lstm_actor
+        rnn = self.policy.rnn_actor
 
         if not isinstance(self.policy, RecurrentActorCriticPolicy):
             raise ValueError("Policy must subclass RecurrentActorCriticPolicy")
 
-        single_hidden_state_shape = (lstm.num_layers, self.n_envs, lstm.hidden_size)
+        single_hidden_state_shape = (rnn.num_layers, self.n_envs, rnn.hidden_size)
         # hidden and cell states for actor and critic
-        self._last_lstm_states = RNNStates(
-            (
-                th.zeros(single_hidden_state_shape, device=self.device),
-                th.zeros(single_hidden_state_shape, device=self.device),
-            ),
-            (
-                th.zeros(single_hidden_state_shape, device=self.device),
-                th.zeros(single_hidden_state_shape, device=self.device),
-            ),
-        )
+        if self.policy.rnn_type == "lstm":
+            self._last_rnn_states = RNNStates(
+                (
+                    th.zeros(single_hidden_state_shape, device=self.device),
+                    th.zeros(single_hidden_state_shape, device=self.device),
+                ),
+                (
+                    th.zeros(single_hidden_state_shape, device=self.device),
+                    th.zeros(single_hidden_state_shape, device=self.device),
+                ),
+            )
+        else:
+            self._last_rnn_states = RNNStates(
+                (
+                    th.zeros(single_hidden_state_shape, device=self.device),
+                ),
+                (
+                    th.zeros(single_hidden_state_shape, device=self.device),
+                ),
+            )
 
-        hidden_state_buffer_shape = (self.n_steps, lstm.num_layers, self.n_envs, lstm.hidden_size)
+        hidden_state_buffer_shape = (self.n_steps, rnn.num_layers, self.n_envs, rnn.hidden_size)
 
         self.rollout_buffer = buffer_cls(
             self.n_steps,
             self.observation_space,
             self.action_space,
             hidden_state_buffer_shape,
+            self.policy.rnn_type,
             self.device,
             gamma=self.gamma,
             gae_lambda=self.gae_lambda,
@@ -219,6 +237,7 @@ class RecurrentPPO(OnPolicyAlgorithm):
         ), f"{rollout_buffer} doesn't support recurrent policy"
 
         assert self._last_obs is not None, "No previous observation was provided"
+
         # Switch to eval mode (this affects batch norm / dropout)
         self.policy.set_training_mode(False)
 
@@ -230,8 +249,14 @@ class RecurrentPPO(OnPolicyAlgorithm):
 
         callback.on_rollout_start()
 
-        lstm_states = deepcopy(self._last_lstm_states)
+        rnn_states = deepcopy(self._last_rnn_states)
 
+        # # Meta-RL: last "last" observation, last action and last rewards needed
+        # if self.meta_rl:
+        #     self._prev_obs = np.copy(self._last_obs)
+        #     self._prev_actions = np.zeros((self.n_envs, self.action_space.shape[0]), dtype=np.float32)
+        #     self._prev_rewards = np.zeros((self.n_envs,), dtype=np.float32)
+        self.unscaled_rewards = []
         while n_steps < n_rollout_steps:
             if self.use_sde and self.sde_sample_freq > 0 and n_steps % self.sde_sample_freq == 0:
                 # Sample a new noise matrix
@@ -241,25 +266,39 @@ class RecurrentPPO(OnPolicyAlgorithm):
                 # Convert to pytorch tensor or to TensorDict
                 obs_tensor = obs_as_tensor(self._last_obs, self.device)
                 episode_starts = th.tensor(self._last_episode_starts, dtype=th.float32, device=self.device)
-                actions, values, log_probs, lstm_states = self.policy.forward(obs_tensor, lstm_states, episode_starts)
+
+                # if self.meta_rl:
+                #     prev_obs = np.concatenate([self._prev_obs, self._prev_actions, np.expand_dims(self._prev_rewards, axis=1)], axis=1)
+                #     prev_obs_tensor = th.as_tensor(prev_obs, device=self.device)
+                #     obs_tensor = (obs_tensor, prev_obs_tensor)
+
+                # policy forward pass
+                actions, values, log_probs, rnn_states = self.policy.forward(obs_tensor, rnn_states, episode_starts)
 
             actions = actions.cpu().numpy()
 
             # Rescale and perform action
             clipped_actions = actions
-            # Clip the actions to avoid out of bound error
-            if isinstance(self.action_space, spaces.Box):
-                clipped_actions = np.clip(actions, self.action_space.low, self.action_space.high)
 
+            # Clip the actions to avoid out of bound error
+            if self.use_beta:   # beta bounded between 0 and 1
+                clipped_actions = 2 * np.pi * actions
+            elif isinstance(self.action_space, spaces.Box):
+                clipped_actions = np.clip(actions, self.action_space.low, self.action_space.high)
+                # clipped_actions = np.tanh(actions)
+                # clipped_actions = self.action_space.high - (1 - clipped_actions) * (self.action_space.high - self.action_space.low) / 2
+            
+            # environment step
             new_obs, rewards, dones, infos = env.step(clipped_actions)
 
             self.num_timesteps += env.num_envs
 
-            # Give access to local variables
+            # Give access to local variables            
             callback.update_locals(locals())
+            
             if not callback.on_step():
                 return False
-
+            
             self._update_info_buffer(infos)
             n_steps += 1
 
@@ -277,14 +316,28 @@ class RecurrentPPO(OnPolicyAlgorithm):
                 ):
                     terminal_obs = self.policy.obs_to_tensor(infos[idx]["terminal_observation"])[0]
                     with th.no_grad():
-                        terminal_lstm_state = (
-                            lstm_states.vf[0][:, idx : idx + 1, :].contiguous(),
-                            lstm_states.vf[1][:, idx : idx + 1, :].contiguous(),
-                        )
-                        # terminal_lstm_state = None
+                        if self.policy.rnn_type == "lstm":
+                            terminal_rnn_state = (
+                                rnn_states.vf[0][:, idx : idx + 1, :].contiguous(),
+                                rnn_states.vf[1][:, idx : idx + 1, :].contiguous(),
+                            )
+                        else:
+                            terminal_rnn_state = (
+                                rnn_states.vf[0][:, idx : idx + 1, :].contiguous(),
+                            )
+                        # terminal_rnn_state = None
                         episode_starts = th.tensor([False], dtype=th.float32, device=self.device)
-                        terminal_value = self.policy.predict_values(terminal_obs, terminal_lstm_state, episode_starts)[0]
+
+                        # if self.meta_rl:    # following is likely to be wrong
+                        #     prev_obs = np.concatenate([self._last_obs, actions, np.expand_dims(rewards, axis=1)], axis=1, dtype=np.float32)
+                        #     prev_obs_tensor = th.as_tensor(prev_obs, device=self.device)
+                        #     terminal_obs = (terminal_obs, prev_obs_tensor[idx : idx + 1])
+
+                        terminal_value = self.policy.predict_values(terminal_obs, terminal_rnn_state, episode_starts)[0]
                     rewards[idx] += self.gamma * terminal_value
+
+            # add to buffer
+            # print("lastobs:", self._last_obs, " and action:", actions)
 
             rollout_buffer.add(
                 self._last_obs,
@@ -293,20 +346,44 @@ class RecurrentPPO(OnPolicyAlgorithm):
                 self._last_episode_starts,
                 values,
                 log_probs,
-                lstm_states=self._last_lstm_states,
+                rnn_states=self._last_rnn_states,
             )
+
+            # # update
+            # if self.meta_rl:
+            #     self._prev_obs = self._last_obs.astype(np.float32)
+            #     self._prev_actions = actions.astype(np.float32)
+            #     self._prev_rewards = rewards.astype(np.float32)
 
             self._last_obs = new_obs
             self._last_episode_starts = dones
-            self._last_lstm_states = lstm_states
+            self._last_rnn_states = rnn_states
+
+            # logging
+            self.logger.record("rollout/scaled_rewards", rewards.mean().item())
+            self.logger.record("rollout/rewards", np.asarray([info["reward"] for info in infos]).mean())
+            self.logger.dump(step=self.num_timesteps)
+
+            self.logger.record(f"rollout/actions_{0}", actions[0].item())
+            self.logger.record(f"rollout/clipped_actions_{0}", clipped_actions[0].item())
+
+            self.logger.dump(step=int(self.num_timesteps/self.n_envs))
+            self.unscaled_rewards.append(rewards)
 
         with th.no_grad():
             # Compute value for the last timestep
             episode_starts = th.tensor(dones, dtype=th.float32, device=self.device)
-            values = self.policy.predict_values(obs_as_tensor(new_obs, self.device), lstm_states.vf, episode_starts)
+            # if self.meta_rl:
+            #     prev_obs = np.concatenate([self._prev_obs, self._prev_actions, self._prev_rewards], axis=1)
+            #     prev_obs_tensor = th.as_tensor(prev_obs, device=self.device)
+            #     obs_tensor = (obs_tensor, prev_obs_tensor)
+            values = self.policy.predict_values(obs_as_tensor(new_obs, self.device), rnn_states.vf, episode_starts)
 
         rollout_buffer.compute_returns_and_advantage(last_values=values, dones=dones)
-
+        
+        coef = np.asarray(self.unscaled_rewards)
+        discounted_unscaled_rollout_returns = np.polynomial.polynomial.polyval(self.gamma, coef, tensor=False)
+        self.logger.record("rollout/disc_rew_sum_mean", discounted_unscaled_rollout_returns.mean())
         callback.on_rollout_end()
 
         return True
@@ -317,6 +394,7 @@ class RecurrentPPO(OnPolicyAlgorithm):
         """
         # Switch to train mode (this affects batch norm / dropout)
         self.policy.set_training_mode(True)
+
         # Update optimizer learning rate
         self._update_learning_rate(self.policy.optimizer)
         # Compute current clip range
@@ -335,8 +413,11 @@ class RecurrentPPO(OnPolicyAlgorithm):
         for epoch in range(self.n_epochs):
             approx_kl_divs = []
             # Do a complete pass on the rollout buffer
+
             for rollout_data in self.rollout_buffer.get(self.batch_size):
+
                 actions = rollout_data.actions
+
                 if isinstance(self.action_space, spaces.Discrete):
                     # Convert discrete action from float to long
                     actions = rollout_data.actions.long().flatten()
@@ -348,14 +429,20 @@ class RecurrentPPO(OnPolicyAlgorithm):
                 if self.use_sde:
                     self.policy.reset_noise(self.batch_size)
 
+                # if self.meta_rl:
+                #     observations = (rollout_data.observations, rollout_data.prev_obs)
+                # else:
+                #     observations = rollout_data.observations
+                # print(actions)
                 values, log_prob, entropy = self.policy.evaluate_actions(
                     rollout_data.observations,
                     actions,
-                    rollout_data.lstm_states,
+                    rollout_data.rnn_states,
                     rollout_data.episode_starts,
                 )
 
                 values = values.flatten()
+
                 # Normalize advantage
                 advantages = rollout_data.advantages
                 if self.normalize_advantage:
@@ -397,6 +484,9 @@ class RecurrentPPO(OnPolicyAlgorithm):
                     entropy_loss = -th.mean(entropy[mask])
 
                 entropy_losses.append(entropy_loss.item())
+                
+                self.logger.record("train/entropy_loss_", entropy_loss.item())
+                self.logger.dump(step=self.num_timesteps)
 
                 loss = policy_loss + self.ent_coef * entropy_loss + self.vf_coef * value_loss
 
@@ -418,6 +508,8 @@ class RecurrentPPO(OnPolicyAlgorithm):
                 # Optimization step
                 self.policy.optimizer.zero_grad()
                 loss.backward()
+                # wandb.log({"loss": loss.item()})
+
                 # Clip grad norm
                 th.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
                 self.policy.optimizer.step()
@@ -481,7 +573,9 @@ class RecurrentPPO(OnPolicyAlgorithm):
                 self.logger.record("time/iterations", iteration, exclude="tensorboard")
                 if len(self.ep_info_buffer) > 0 and len(self.ep_info_buffer[0]) > 0:
                     self.logger.record("rollout/ep_rew_mean", safe_mean([ep_info["r"] for ep_info in self.ep_info_buffer]))
+                    self.logger.record("rollout/ep_rew_mean_norm", safe_mean([ep_info["r"] for ep_info in self.ep_info_buffer]) / self.env.get_attr("max_steps", 0)[0])
                     self.logger.record("rollout/ep_len_mean", safe_mean([ep_info["l"] for ep_info in self.ep_info_buffer]))
+                    
                 self.logger.record("time/fps", fps)
                 self.logger.record("time/time_elapsed", int(time_elapsed), exclude="tensorboard")
                 self.logger.record("time/total_timesteps", self.num_timesteps, exclude="tensorboard")
